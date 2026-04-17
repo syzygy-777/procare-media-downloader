@@ -34,7 +34,13 @@ You'll be prompted for:
 | Subdomain | `yourschool` | From your portal URL `schools.yourschool.procareconnect.com` |
 | Email | `parent@example.com` | Your Procare parent login email |
 | Password | *(hidden)* | Your Procare password |
-| Month | `March 2026` | Target month (also accepts `2026-03`) |
+| Month | `March 2026` | Target month(s) — see formats below |
+
+Supported month formats:
+- Single month: `March 2026` or `2026-03`
+- Range with dash: `Jan 2026 - Apr 2026` or `2026-01 - 2026-03`
+- Range with "to": `Jan 2026 to Apr 2026`
+- Comma-separated: `March 2026, May 2026` or `2026-03, 2026-05`
 
 ## Output
 

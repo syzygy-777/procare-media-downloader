@@ -2,13 +2,18 @@
 """
 Procare Media Downloader
 
-Downloads all photos and videos from Procare daily activities for a given month.
+Downloads all photos and videos from Procare daily activities for one or more months.
 Works with the parent portal at schools.*.procareconnect.com.
 
 Usage:
     python3 procare_downloader.py
 
-You'll be prompted for your email, password, subdomain, and target month.
+You'll be prompted for your email, password, subdomain, and target month(s).
+
+Supports:
+    - Single month:  March 2026
+    - Comma list:    March 2026, April 2026
+    - Range:         January 2026 - April 2026
 """
 
 import os
@@ -155,26 +160,76 @@ def download_file(session, url, dest_path):
         return False
 
 
-def parse_month_input(month_str):
-    """Parse 'March 2026' or '2026-03' into (date_from, date_to) strings."""
+def parse_single_month(month_str):
+    """Parse 'March 2026' or '2026-03' into a datetime (first of that month)."""
     for fmt in ("%B %Y", "%b %Y", "%Y-%m"):
         try:
-            dt = datetime.strptime(month_str.strip(), fmt)
-            year, month = dt.year, dt.month
-            date_from = f"{year}-{month:02d}-01"
-
-            if month == 12:
-                date_to = f"{year}-12-31"
-            else:
-                next_month = datetime(year, month + 1, 1)
-                last_day = next_month - timedelta(days=1)
-                date_to = last_day.strftime("%Y-%m-%d")
-
-            return date_from, date_to
+            return datetime.strptime(month_str.strip(), fmt)
         except ValueError:
             continue
-
     raise ValueError(f"Could not parse '{month_str}'. Use format like 'March 2026' or '2026-03'.")
+
+
+def month_date_range(dt):
+    """Return (date_from, date_to) strings for a given month datetime."""
+    year, month = dt.year, dt.month
+    date_from = f"{year}-{month:02d}-01"
+    if month == 12:
+        date_to = f"{year}-12-31"
+    else:
+        last_day = datetime(year, month + 1, 1) - timedelta(days=1)
+        date_to = last_day.strftime("%Y-%m-%d")
+    return date_from, date_to
+
+
+def expand_month_range(start_dt, end_dt):
+    """Generate a list of month datetimes from start to end (inclusive)."""
+    months = []
+    current = start_dt.replace(day=1)
+    end = end_dt.replace(day=1)
+    while current <= end:
+        months.append(current)
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
+    return months
+
+
+def parse_months_input(months_str):
+    """Parse month input supporting single, comma-separated, and range formats.
+
+    Returns a list of (date_from, date_to) tuples.
+
+    Examples:
+        'March 2026'                       -> [('2026-03-01', '2026-03-31')]
+        'March 2026, May 2026'             -> [('2026-03-01', '2026-03-31'), ('2026-05-01', '2026-05-31')]
+        'January 2026 - April 2026'        -> [(...), (...), (...), (...)]
+    """
+    months_str = months_str.strip()
+
+    # Check for 'to' keyword range: 'Jan 2026 to Apr 2026'
+    to_match = re.split(r'\s+to\s+', months_str, maxsplit=1, flags=re.IGNORECASE)
+    if len(to_match) == 2:
+        start_dt = parse_single_month(to_match[0])
+        end_dt = parse_single_month(to_match[1])
+        if end_dt < start_dt:
+            raise ValueError("End month must be after start month.")
+        return [month_date_range(dt) for dt in expand_month_range(start_dt, end_dt)]
+
+    # Check for dash/en-dash range, but avoid splitting YYYY-MM on the internal hyphen.
+    # We require at least one space around the separator to distinguish from YYYY-MM.
+    dash_match = re.split(r'\s+[-–]\s+', months_str, maxsplit=1)
+    if len(dash_match) == 2:
+        start_dt = parse_single_month(dash_match[0])
+        end_dt = parse_single_month(dash_match[1])
+        if end_dt < start_dt:
+            raise ValueError("End month must be after start month.")
+        return [month_date_range(dt) for dt in expand_month_range(start_dt, end_dt)]
+
+    # Check for comma-separated list
+    parts = [p.strip() for p in months_str.split(",") if p.strip()]
+    return [month_date_range(parse_single_month(p)) for p in parts]
 
 
 def main():
@@ -183,16 +238,14 @@ def main():
     subdomain = input("Subdomain (e.g. for schools.yourschool.procareconnect.com enter 'yourschool'): ").strip()
     email = input("Email: ").strip()
     password = getpass.getpass("Password: ")
-    month_str = input("Month to download (e.g. 'March 2026'): ").strip()
+    print("Month(s) to download. Supported formats:")
+    print("  Single:  March 2026  or  2026-03")
+    print("  Range:   Jan 2026 - Apr 2026  or  2026-01 - 2026-03  or  Jan 2026 to Apr 2026")
+    print("  List:    March 2026, May 2026  or  2026-03, 2026-05")
+    month_str = input("Enter month(s): ").strip()
 
-    date_from, date_to = parse_month_input(month_str)
-    print(f"\nDate range: {date_from} to {date_to}")
-
-    # Output folder
-    folder_name = datetime.strptime(date_from, "%Y-%m-%d").strftime("%Y-%m_%B")
-    output_dir = Path("procare_downloads") / folder_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Saving to: {output_dir}/\n")
+    month_ranges = parse_months_input(month_str)
+    print(f"\n{len(month_ranges)} month(s) to download\n")
 
     session = requests.Session()
     api_host = f"api-school.{subdomain}.{BASE_DOMAIN}"
@@ -206,33 +259,40 @@ def main():
     children = get_children(session, api_host, token)
     print(f"Found {len(children)} child(ren)\n")
 
-    total_downloaded = 0
-    for child in children:
-        kid_id = child.get("id")
-        kid_name = child.get("first_name", "child")
-        print(f"--- {kid_name} ---")
+    grand_total = 0
+    for date_from, date_to in month_ranges:
+        folder_name = datetime.strptime(date_from, "%Y-%m-%d").strftime("%Y-%m_%B")
+        output_dir = Path("procare_downloads") / folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        activities = get_activities(session, api_host, token, kid_id, date_from, date_to)
-        print(f"  Total activities: {len(activities)}")
+        print(f"=== {folder_name} ({date_from} to {date_to}) → {output_dir}/ ===\n")
 
-        media_count = 0
-        for activity in activities:
-            urls = extract_media_urls(activity)
-            for i, url in enumerate(urls):
-                filename = safe_filename(url, activity, i)
-                dest = output_dir / filename
-                if dest.exists():
-                    print(f"  ⊘ Already exists: {filename}")
-                    media_count += 1
-                    continue
-                print(f"  ↓ {filename}")
-                if download_file(session, url, dest):
-                    media_count += 1
+        for child in children:
+            kid_id = child.get("id")
+            kid_name = child.get("first_name", "child")
+            print(f"--- {kid_name} ---")
 
-        print(f"  Downloaded {media_count} files for {kid_name}\n")
-        total_downloaded += media_count
+            activities = get_activities(session, api_host, token, kid_id, date_from, date_to)
+            print(f"  Total activities: {len(activities)}")
 
-    print(f"\n=== Done! {total_downloaded} total files saved to {output_dir}/ ===")
+            media_count = 0
+            for activity in activities:
+                urls = extract_media_urls(activity)
+                for i, url in enumerate(urls):
+                    filename = safe_filename(url, activity, i)
+                    dest = output_dir / filename
+                    if dest.exists():
+                        print(f"  ⊘ Already exists: {filename}")
+                        media_count += 1
+                        continue
+                    print(f"  ↓ {filename}")
+                    if download_file(session, url, dest):
+                        media_count += 1
+
+            print(f"  Downloaded {media_count} files for {kid_name}\n")
+            grand_total += media_count
+
+    print(f"\n=== Done! {grand_total} total files downloaded ===")
 
 
 if __name__ == "__main__":
