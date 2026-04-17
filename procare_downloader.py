@@ -101,36 +101,75 @@ def get_activities(session, api_host, token, kid_id, date_from, date_to):
 
 
 def extract_media_urls(activity):
-    """Extract all downloadable media URLs from any activity type."""
+    """Extract all downloadable media URLs from any activity type.
+
+    Returns a list of (url, is_video) tuples.
+    When an activity is a video, only the video file URL is returned (thumbnails are skipped).
+    """
     urls = []
     act = activity.get("activiable") or activity
+    activity_is_video = bool(act.get("is_video"))
 
-    # Direct photo/video fields
-    for key in ("main_url", "photo_url", "original_url", "media_url", "image_url"):
-        val = act.get(key)
-        if val and isinstance(val, str) and val.startswith("http"):
-            urls.append(val)
-
-    if act.get("is_video") and act.get("video_file_url"):
-        urls.append(act["video_file_url"])
+    # If this is a video activity, only grab the video file URL
+    if activity_is_video:
+        video_url = act.get("video_file_url")
+        if video_url and isinstance(video_url, str) and video_url.startswith("http"):
+            urls.append((video_url, True))
+    else:
+        # Photo/other: grab image URLs
+        for key in ("main_url", "photo_url", "original_url", "media_url", "image_url"):
+            val = act.get(key)
+            if val and isinstance(val, str) and val.startswith("http"):
+                urls.append((val, False))
 
     # Media embedded in nested structures
     for key in ("photos", "videos", "media", "attachments", "images"):
+        is_video_key = key == "videos"
         items = act.get(key, [])
         if isinstance(items, list):
             for item in items:
                 if isinstance(item, str) and item.startswith("http"):
-                    urls.append(item)
+                    urls.append((item, is_video_key))
                 elif isinstance(item, dict):
-                    for sub_key in ("url", "main_url", "original_url", "photo_url", "video_file_url", "media_url"):
-                        v = item.get(sub_key)
-                        if v and isinstance(v, str) and v.startswith("http"):
-                            urls.append(v)
+                    item_is_video = is_video_key or item.get("is_video", False)
+                    if item_is_video:
+                        # Only grab video file URLs, skip thumbnails
+                        for sub_key in ("video_file_url", "url", "original_url", "media_url"):
+                            v = item.get(sub_key)
+                            if v and isinstance(v, str) and v.startswith("http"):
+                                urls.append((v, True))
+                                break
+                    else:
+                        for sub_key in ("url", "main_url", "original_url", "photo_url", "media_url"):
+                            v = item.get(sub_key)
+                            if v and isinstance(v, str) and v.startswith("http"):
+                                urls.append((v, False))
 
-    return list(dict.fromkeys(urls))  # dedupe preserving order
+    # dedupe preserving order (by url)
+    seen = set()
+    deduped = []
+    for url, is_video in urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append((url, is_video))
+    return deduped
 
 
-def safe_filename(url, activity, index):
+CONTENT_TYPE_EXT = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-msvideo": ".avi",
+    "video/webm": ".webm",
+    "video/3gpp": ".3gp",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+}
+
+
+def safe_filename(url, activity, index, is_video=False):
     """Generate a filename from activity metadata and URL."""
     created = activity.get("created_at", "") or activity.get("activity_date", "")
     date_part = re.sub(r"[^\d\-T]", "", created[:19]).replace("T", "_") if created else "unknown"
@@ -141,23 +180,32 @@ def safe_filename(url, activity, index):
     path = urlparse(url).path
     ext = Path(path).suffix.lower()
     if not ext or len(ext) > 6:
-        ext = ".jpg"  # default
+        ext = ".mp4" if is_video else ".jpg"
 
     return f"{date_part}_{act_type}_{act_id}_{index}{ext}"
 
 
 def download_file(session, url, dest_path):
-    """Download a file to disk."""
+    """Download a file to disk. Returns the final path (extension may change based on content type)."""
     try:
         resp = session.get(url, stream=True, timeout=60)
         resp.raise_for_status()
+
+        # Check content type and fix extension if needed
+        content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if content_type in CONTENT_TYPE_EXT:
+            correct_ext = CONTENT_TYPE_EXT[content_type]
+            current_ext = Path(dest_path).suffix.lower()
+            if current_ext != correct_ext:
+                dest_path = Path(str(dest_path).rsplit(".", 1)[0] + correct_ext)
+
         with open(dest_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
-        return True
+        return dest_path
     except Exception as e:
         print(f"  ✗ Failed to download {url}: {e}")
-        return False
+        return None
 
 
 def parse_single_month(month_str):
@@ -277,16 +325,20 @@ def main():
 
             media_count = 0
             for activity in activities:
-                urls = extract_media_urls(activity)
-                for i, url in enumerate(urls):
-                    filename = safe_filename(url, activity, i)
+                media_items = extract_media_urls(activity)
+                for i, (url, is_video) in enumerate(media_items):
+                    filename = safe_filename(url, activity, i, is_video)
                     dest = output_dir / filename
                     if dest.exists():
                         print(f"  ⊘ Already exists: {filename}")
                         media_count += 1
                         continue
                     print(f"  ↓ {filename}")
-                    if download_file(session, url, dest):
+                    result = download_file(session, url, dest)
+                    if result:
+                        final_name = Path(result).name
+                        if final_name != filename:
+                            print(f"    → saved as {final_name}")
                         media_count += 1
 
             print(f"  Downloaded {media_count} files for {kid_name}\n")
